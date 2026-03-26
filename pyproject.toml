@@ -1,0 +1,31 @@
+[project]
+name = "postgresqlconnector"
+version = "0.1.0"
+description = "Ultimate PostgreSQL Connector with TimescaleDB and pgvector support for Python 3.12+"
+authors = [
+    {name = "MinhSonCQF", email = "nguyen.minhson1511@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "pandas (>=3.0.1,<4.0.0)",
+    "sqlalchemy (>=2.0.48,<3.0.0)",
+    "psycopg2-binary (>=2.9.11,<3.0.0)",
+    "pgvector (>=0.4.2,<0.5.0)",
+    "loguru (>=0.7.3,<0.8.0)"
+]
+
+[tool.poetry]
+# Chuyển phần khai báo gói code xuống đây và chỉ định đích danh file .py
+packages = [
+    { include = "postgres_connector.py", from = "src" }
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.0.2,<10.0.0)"
+]
