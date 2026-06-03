@@ -1,4 +1,4 @@
-# 🚀 PostgresConnector (Ultimate Edition)
+# 🚀 PostgresConnector
 
 ## 📖 Introduction
 Welcome to **PostgresConnector**, the ultimate database connection package built for our team's data engineering and AI workflows. 

@@ -22,12 +22,14 @@ class PostgresConnector:
 
     def __init__(self, host: str, database: str, 
                  username: str, password: str, port: int = 5432,
+                 schema: str = "public", # Default to public if not provided
                  **kwargs):
         self.host = host
         self.database = database
         self.username = username
         self.password = password
         self.port = port
+        self.schema = schema # Store the schema
         
         self.connection_url = URL.create(
             "postgresql+psycopg2",
@@ -38,12 +40,20 @@ class PostgresConnector:
             database=self.database
         )
         
-        # Postgres driver tự động xử lý executemany tối ưu bằng execute_values nếu được cấu hình
+        # Pass the schema to the search_path via connect_args
         self.engine = create_engine(
                     self.connection_url,
                     pool_pre_ping=True,
-                    insertmanyvalues_page_size=10000 # Tối ưu hóa bulk insert (cú pháp mới)
+                    insertmanyvalues_page_size=10000,
+                    connect_args={'options': f'-csearch_path={self.schema}'} # <-- This handles the routing
                 )
+                
+        # Optional but recommended: Automatically create the schema if it doesn't exist yet
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}";'))
+        except Exception as e:
+            logger.warning(f"Could not verify or create schema '{self.schema}': {e}")
 
     def execute_query(self, query: str, params: Optional[Dict] = None):
         """Thực thi lệnh không trả về dữ liệu (VD: CREATE EXTENSION, DROP TABLE)"""
@@ -144,6 +154,54 @@ class PostgresConnector:
             logger.success(f"Created {index_type} index on {table_name}.{vector_column}")
         except Exception as e:
             logger.error(f"Failed to create vector index: {e}")
+    
+    def replace_table(self, df: pd.DataFrame, target_table: str, primary_key: Union[str, List[str]] = None):
+        """Thay thế toàn bộ bảng (Full Refresh)."""
+        if df.empty: return
+        
+        dtype_mapping = self._generate_dtype_mapping(df)
+        try:
+            with self.engine.begin() as conn:
+                logger.info(f"Replacing table '{target_table}'...")
+                df.to_sql(target_table, conn, if_exists='replace', index=False, dtype=dtype_mapping)
+                
+                if primary_key:
+                    pk_cols = [primary_key] if isinstance(primary_key, str) else primary_key
+                    pk_str = ", ".join([f'"{c}"' for c in pk_cols])
+                    conn.execute(text(f'ALTER TABLE "{target_table}" ADD PRIMARY KEY ({pk_str})'))
+                logger.success(f"Successfully replaced table '{target_table}'.")
+        except Exception as e:
+            logger.error(f"Replace table failed: {e}")
+            raise e
+
+    def delete_and_insert(self, df: pd.DataFrame, target_table: str, delete_keys: Union[str, List[str]]):
+        """Idempotent load: Xóa dữ liệu cũ theo keys trước khi Insert."""
+        if df.empty: return
+        
+        keys = [delete_keys] if isinstance(delete_keys, str) else delete_keys
+        dtype_mapping = self._generate_dtype_mapping(df)
+        
+        try:
+            with self.engine.begin() as conn:
+                inspector = inspect(conn)
+                if not inspector.has_table(target_table):
+                    df.to_sql(target_table, conn, index=False, dtype=dtype_mapping)
+                    return
+                
+                # DELETE phase
+                for key in keys:
+                    unique_vals = df[key].dropna().unique()
+                    if len(unique_vals) > 0:
+                        # Format for SQL IN clause
+                        vals_str = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in unique_vals])
+                        conn.execute(text(f'DELETE FROM "{target_table}" WHERE "{key}" IN ({vals_str})'))
+                
+                # INSERT phase
+                df.to_sql(target_table, conn, if_exists='append', index=False, dtype=dtype_mapping)
+                logger.success(f"Delete & Insert completed for {target_table}.")
+        except Exception as e:
+            logger.error(f"Delete and Insert failed: {e}")
+            raise e
 
     # ==========================================
     # CORE OPERATIONS (Upsert, Replace)
@@ -194,34 +252,32 @@ class PostgresConnector:
 
                 # 3. Tạo câu lệnh Upsert (Sử dụng SQLAlchemy postgresql.insert)
                 table_cols = df.columns.tolist()
-                records = df.to_dict(orient='records')
-                
-                # Load cấu trúc bảng thực tế từ Database thành Table object
-                metadata_obj = MetaData()
-                target_table_obj = Table(target_table, metadata_obj, autoload_with=conn)
-                
-                # Truyền Table object vào hàm insert
-                insert_stmt = insert(target_table_obj).values(records)
-                
-                if conflict_strategy == 'skip':
-                    upsert_stmt = insert_stmt.on_conflict_do_nothing(index_elements=join_keys)
-                else:
-                    update_dict = {
-                        col: insert_stmt.excluded[col] 
-                        for col in table_cols if col not in join_keys
-                    }
+                chunk_size = 10000 
+                for i in range(0, len(df), chunk_size):
+                    df_chunk = df.iloc[i : i + chunk_size]
+                    records = df_chunk.to_dict(orient='records')
                     
-                    if conflict_strategy == 'sum':
-                        for col in update_dict:
-                            if pd.api.types.is_numeric_dtype(df[col]):
-                                update_dict[col] = text(f'"{target_table}"."{col}" + EXCLUDED."{col}"')
-
-                    upsert_stmt = insert_stmt.on_conflict_do_update(
-                        index_elements=join_keys,
-                        set_=update_dict
-                    )
-
-                conn.execute(upsert_stmt)
+                    metadata_obj = MetaData()
+                    target_table_obj = Table(target_table, metadata_obj, autoload_with=conn)
+                    insert_stmt = insert(target_table_obj).values(records)
+                    
+                    if conflict_strategy == 'skip':
+                        upsert_stmt = insert_stmt.on_conflict_do_nothing(index_elements=join_keys)
+                    else:
+                        update_dict = {
+                            col: insert_stmt.excluded[col] 
+                            for col in table_cols if col not in join_keys
+                        }
+                        if conflict_strategy == 'sum':
+                            for col in update_dict:
+                                if pd.api.types.is_numeric_dtype(df[col]):
+                                    update_dict[col] = target_table_obj.c[col] + insert_stmt.excluded[col]
+                                    
+                        upsert_stmt = insert_stmt.on_conflict_do_update(
+                            index_elements=join_keys,
+                            set_=update_dict
+                        )
+                    conn.execute(upsert_stmt)
                 logger.success(f"Upserted {len(df)} rows to {target_table} (Strategy: {conflict_strategy})")
 
         except Exception as e:
