@@ -1,6 +1,6 @@
 [project]
 name = "pyposconnector"
-version = "0.1.2"
+version = "0.1.12"
 description = "PostgreSQL Connector with TimescaleDB and pgvector support for Python 3.12+"
 authors = [
     {name = "MinhSonCQF", email = "nguyen.minhson1511@gmail.com"}

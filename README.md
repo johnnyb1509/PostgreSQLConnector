@@ -5,6 +5,22 @@ Welcome to **PostgresConnector**, the ultimate database connection package built
 
 This package simplifies interactions with PostgreSQL databases by automating tedious tasks like schema evolution, data type mapping, and bulk upserts. It goes beyond standard SQL by providing native, out-of-the-box support for **TimescaleDB** (for time-series data) and **pgvector** (for AI embeddings).
 
+## Change logs 2026-06:
+### 1. Native NumPy & PyArrow Data Type Translation
+When working with heavy data-analysis frameworks like Pandas, data columns are frequently compiled into low-level C-based NumPy primitives (e.g., `numpy.int64`, `numpy.float64`, or optimized Unicode string blocks like `numpy.str_`). Standard PostgreSQL drivers (`psycopg2`) strictly reject these types, throwing cryptic errors such as:
+> `ProgrammingError: can't adapt type 'numpy.int64'` or `numpy string dtypes are not allowed`
+
+`PostgresConnector` implements a **Native Python Sanitization Layer** directly at the database boundary inside all write operations (`upsert_data`, `replace_table`, and `delete_and_insert`). It dynamically intercepts incoming records, extracts their pure scalar elements via memory pointer stripping (`.item()`), and flawlessly casts them to standard PostgreSQL types:
+* `numpy.integer` / `int64` $\rightarrow$ `BIGINT`
+* `numpy.floating` / `float64` $\rightarrow$ `DOUBLE PRECISION`
+* `numpy.str_` / Unicode arrays $\rightarrow$ `TEXT`
+* `numpy.bool_` $\rightarrow$ `BOOLEAN`
+
+### 2. Strict Schema Separation (Multi-Tenant Routing)
+Unlike default drivers that query only the `public` namespace, this connector features explicit multi-schema resolution. When establishing a connection, passing a specific `schema` ensures that tables are isolated dynamically. 
+
+All diagnostic operations—such as `inspect().has_table()` and structural migrations (`_add_missing_columns`)—explicitly target your specified schema, ensuring that **Schema Evolution** functions seamlessly without creating false-positive duplicate tables in the `public` space.
+
 ### ✨ Key Features
 * **Smart Upsert (`ON CONFLICT DO UPDATE`):** Blazing fast data ingestion with conflict resolution strategies (`last`, `sum`, `skip`).
 * **Auto Schema Evolution:** Automatically adds missing columns to your database tables based on your Pandas DataFrames.

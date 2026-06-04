@@ -1,35 +1,28 @@
 import os
 import pandas as pd
 import numpy as np
-import uuid
 from typing import List, Optional, Dict, Union, Literal
 from loguru import logger
 from sqlalchemy import create_engine, text, URL, inspect, MetaData, Table
 from sqlalchemy.types import BIGINT, DATE
 from sqlalchemy.dialects.postgresql import JSONB, DOUBLE_PRECISION, TEXT, TIMESTAMP, insert
-from pgvector.sqlalchemy import Vector # Cần cài đặt thư viện pgvector
+from pgvector.sqlalchemy import Vector
 
 class PostgresConnector:
     """
     Trình kết nối PostgreSQL chuẩn hóa (Ultimate Version).
-    
-    Features:
-    - Core: Fast Execute, Schema Evolution, Native PostgreSQL types (TEXT, JSONB).
-    - Upsert: Sử dụng ON CONFLICT DO UPDATE nguyên bản của Postgres.
-    - Extensions: Hỗ trợ TimescaleDB (Hypertable) cho Time-series và pgvector cho AI.
-    - Strategies: 'last' (Update), 'skip' (Ignore), 'sum' (Aggregate numeric).
     """
 
     def __init__(self, host: str, database: str, 
                  username: str, password: str, port: int = 5432,
-                 schema: str = "public", # Default to public if not provided
+                 schema: str = "public", 
                  **kwargs):
         self.host = host
         self.database = database
         self.username = username
         self.password = password
         self.port = port
-        self.schema = schema # Store the schema
+        self.schema = schema 
         
         self.connection_url = URL.create(
             "postgresql+psycopg2",
@@ -40,23 +33,14 @@ class PostgresConnector:
             database=self.database
         )
         
-        # Pass the schema to the search_path via connect_args
         self.engine = create_engine(
                     self.connection_url,
                     pool_pre_ping=True,
                     insertmanyvalues_page_size=10000,
-                    connect_args={'options': f'-csearch_path={self.schema}'} # <-- This handles the routing
+                    connect_args={'options': f'-csearch_path={self.schema}'} 
                 )
-                
-        # Optional but recommended: Automatically create the schema if it doesn't exist yet
-        try:
-            with self.engine.begin() as conn:
-                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}";'))
-        except Exception as e:
-            logger.warning(f"Could not verify or create schema '{self.schema}': {e}")
 
     def execute_query(self, query: str, params: Optional[Dict] = None):
-        """Thực thi lệnh không trả về dữ liệu (VD: CREATE EXTENSION, DROP TABLE)"""
         try:
             with self.engine.begin() as conn:
                 conn.execute(text(query), params or {})
@@ -73,19 +57,15 @@ class PostgresConnector:
             raise e
 
     def _generate_dtype_mapping(self, df: pd.DataFrame) -> Dict:
-        """Tự động map kiểu dữ liệu, tích hợp nhận diện JSONB và VECTOR"""
         dtype_map = {}
         for col in df.columns:
             sample_val = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
             
-            # 1. Nhận diện Vector (List các số thực)
             if isinstance(sample_val, list) and all(isinstance(x, (int, float)) for x in sample_val):
                 dim = len(sample_val)
                 dtype_map[col] = Vector(dim)
-            # 2. Nhận diện JSONB (Dict hoặc List chứa Dict/String)
             elif isinstance(sample_val, (dict, list)):
                 dtype_map[col] = JSONB()
-            # 3. Các kiểu dữ liệu cơ bản
             elif pd.api.types.is_string_dtype(df[col]) or df[col].dtype == 'object':
                 dtype_map[col] = TEXT()
             elif pd.api.types.is_datetime64_any_dtype(df[col]):
@@ -99,7 +79,7 @@ class PostgresConnector:
 
     def _get_table_columns(self, table_name: str, conn) -> List[str]:
         inspector = inspect(conn)
-        return [col['name'] for col in inspector.get_columns(table_name)]
+        return [col['name'] for col in inspector.get_columns(table_name, schema=self.schema)]
 
     def _add_missing_columns(self, table_name: str, missing_cols: List[str], dtype_map: Dict, conn):
         for col in missing_cols:
@@ -112,100 +92,102 @@ class PostgresConnector:
             elif isinstance(col_type, JSONB): type_str = "JSONB"
             elif isinstance(col_type, Vector): type_str = f"VECTOR({col_type.dim})"
             
-            conn.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" {type_str}'))
-            logger.info(f"Auto-evolve: Added column '{col}' to '{table_name}'")
+            conn.execute(text(f'ALTER TABLE "{self.schema}"."{table_name}" ADD COLUMN "{col}" {type_str}'))
+            logger.info(f"Auto-evolve: Added column '{col}' to '{self.schema}.{table_name}'")
+
+    def _clean_records(self, records: List[Dict]) -> List[Dict]:
+        """
+        THE MASTER SANITIZER.
+        Converts ALL Pandas/Numpy types to pure Python primitives.
+        """
+        clean_records = []
+        for rec in records:
+            clean_rec = {}
+            for k, v in rec.items():
+                safe_k = str(k).lower()
+                
+                if pd.isna(v):
+                    clean_rec[safe_k] = None
+                elif isinstance(v, pd.Timestamp):
+                    clean_rec[safe_k] = v.to_pydatetime()
+                elif hasattr(v, 'item'): 
+                    clean_rec[safe_k] = v.item()
+                else:
+                    clean_rec[safe_k] = v
+            clean_records.append(clean_rec)
+        return clean_records
 
     # ==========================================
-    # DATABASE EXTENSIONS (Timescale & pgvector)
+    # CORE OPERATIONS
     # ==========================================
-
-    def setup_extensions(self):
-        """Kích hoạt các extension cần thiết cho Database"""
-        self.execute_query("CREATE EXTENSION IF NOT EXISTS vector;")
-        # Nếu Postgres đã cài sẵn TimescaleDB plugin, ta có thể tạo extension:
-        self.execute_query("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
-        logger.info("Checked and created 'vector' & 'timescaledb' extensions if applicable.")
-
-    def enable_timescaledb(self, table_name: str, time_column: str, chunk_time_interval: str = '1 day'):
-        """
-        Chuyển đổi bảng thành Hypertable của TimescaleDB.
-        Phù hợp cho dữ liệu crawl hàng ngày, logs, IoT, chứng khoán.
-        """
-        try:
-            sql = f"""
-            SELECT create_hypertable('{table_name}', '{time_column}', 
-                   chunk_time_interval => INTERVAL '{chunk_time_interval}', 
-                   if_not_exists => TRUE);
-            """
-            self.execute_query(sql)
-            logger.success(f"Converted {table_name} to TimescaleDB Hypertable on column {time_column}.")
-        except Exception as e:
-            logger.error(f"Could not convert to Hypertable (is TimescaleDB installed?): {e}")
-
-    def create_vector_index(self, table_name: str, vector_column: str, index_type: Literal['hnsw', 'ivfflat'] = 'hnsw'):
-        """Tạo index cho cột Vector để tìm kiếm semantic search nhanh hơn"""
-        index_name = f"idx_{table_name}_{vector_column}_{index_type}"
-        try:
-            if index_type == 'hnsw':
-                sql = f'CREATE INDEX IF NOT EXISTS {index_name} ON "{table_name}" USING hnsw ("{vector_column}" vector_l2_ops);'
-            else:
-                sql = f'CREATE INDEX IF NOT EXISTS {index_name} ON "{table_name}" USING ivfflat ("{vector_column}" vector_l2_ops) WITH (lists = 100);'
-            self.execute_query(sql)
-            logger.success(f"Created {index_type} index on {table_name}.{vector_column}")
-        except Exception as e:
-            logger.error(f"Failed to create vector index: {e}")
-    
     def replace_table(self, df: pd.DataFrame, target_table: str, primary_key: Union[str, List[str]] = None):
-        """Thay thế toàn bộ bảng (Full Refresh)."""
         if df.empty: return
-        
         dtype_mapping = self._generate_dtype_mapping(df)
+        
         try:
             with self.engine.begin() as conn:
                 logger.info(f"Replacing table '{target_table}'...")
-                df.to_sql(target_table, conn, if_exists='replace', index=False, dtype=dtype_mapping)
+                df.iloc[:0].to_sql(target_table, conn, schema=self.schema, if_exists='replace', index=False, dtype=dtype_mapping)
                 
                 if primary_key:
                     pk_cols = [primary_key] if isinstance(primary_key, str) else primary_key
                     pk_str = ", ".join([f'"{c}"' for c in pk_cols])
-                    conn.execute(text(f'ALTER TABLE "{target_table}" ADD PRIMARY KEY ({pk_str})'))
-                logger.success(f"Successfully replaced table '{target_table}'.")
+                    conn.execute(text(f'ALTER TABLE "{self.schema}"."{target_table}" ADD PRIMARY KEY ({pk_str})'))
+                
+                metadata_obj = MetaData()
+                target_table_obj = Table(target_table, metadata_obj, schema=self.schema, autoload_with=conn)
+                
+                # SAFE CHUNK SIZE FOR POSTGRESQL (32,767 param limit)
+                chunk_size = 500 
+                for i in range(0, len(df), chunk_size):
+                    raw_records = df.iloc[i : i + chunk_size].to_dict(orient='records')
+                    clean_records = self._clean_records(raw_records)
+                    
+                    conn.execute(insert(target_table_obj).values(clean_records))
+                    
+                logger.success(f"Successfully replaced table '{target_table}' with {len(df)} rows.")
         except Exception as e:
-            logger.error(f"Replace table failed: {e}")
-            raise e
+            error_msg = str(e)
+            if len(error_msg) > 1000:
+                error_msg = error_msg[:1000] + "\n... [SQL LOG TRUNCATED TO PREVENT TERMINAL SPAM] ..."
+            logger.error(f"Replace table failed: {error_msg}")
+            raise RuntimeError(f"Database operation failed. Check logs.")
 
     def delete_and_insert(self, df: pd.DataFrame, target_table: str, delete_keys: Union[str, List[str]]):
-        """Idempotent load: Xóa dữ liệu cũ theo keys trước khi Insert."""
         if df.empty: return
-        
         keys = [delete_keys] if isinstance(delete_keys, str) else delete_keys
         dtype_mapping = self._generate_dtype_mapping(df)
         
         try:
             with self.engine.begin() as conn:
                 inspector = inspect(conn)
-                if not inspector.has_table(target_table):
-                    df.to_sql(target_table, conn, index=False, dtype=dtype_mapping)
-                    return
+                if not inspector.has_table(target_table, schema=self.schema):
+                    df.iloc[:0].to_sql(target_table, conn, schema=self.schema, index=False, dtype=dtype_mapping)
+                else:
+                    for key in keys:
+                        unique_vals = df[key].dropna().unique()
+                        if len(unique_vals) > 0:
+                            vals_str = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in unique_vals])
+                            conn.execute(text(f'DELETE FROM "{self.schema}"."{target_table}" WHERE "{key}" IN ({vals_str})'))
                 
-                # DELETE phase
-                for key in keys:
-                    unique_vals = df[key].dropna().unique()
-                    if len(unique_vals) > 0:
-                        # Format for SQL IN clause
-                        vals_str = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in unique_vals])
-                        conn.execute(text(f'DELETE FROM "{target_table}" WHERE "{key}" IN ({vals_str})'))
+                metadata_obj = MetaData()
+                target_table_obj = Table(target_table, metadata_obj, schema=self.schema, autoload_with=conn)
                 
-                # INSERT phase
-                df.to_sql(target_table, conn, if_exists='append', index=False, dtype=dtype_mapping)
-                logger.success(f"Delete & Insert completed for {target_table}.")
+                # SAFE CHUNK SIZE FOR POSTGRESQL (32,767 param limit)
+                chunk_size = 500 
+                for i in range(0, len(df), chunk_size):
+                    raw_records = df.iloc[i : i + chunk_size].to_dict(orient='records')
+                    clean_records = self._clean_records(raw_records)
+                    
+                    conn.execute(insert(target_table_obj).values(clean_records))
+                    
+                logger.success(f"Delete & Insert completed for {target_table}. Inserted {len(df)} rows.")
         except Exception as e:
-            logger.error(f"Delete and Insert failed: {e}")
-            raise e
-
-    # ==========================================
-    # CORE OPERATIONS (Upsert, Replace)
-    # ==========================================
+            error_msg = str(e)
+            if len(error_msg) > 1000:
+                error_msg = error_msg[:1000] + "\n... [SQL LOG TRUNCATED TO PREVENT TERMINAL SPAM] ..."
+            logger.error(f"Delete and Insert failed: {error_msg}")
+            raise RuntimeError(f"Database operation failed. Check logs.")
 
     def upsert_data(self, 
                     df: pd.DataFrame, 
@@ -213,20 +195,18 @@ class PostgresConnector:
                     primary_key: Union[str, List[str]] = None, 
                     auto_evolve_schema: bool = True,
                     conflict_strategy: Literal['sum', 'last', 'skip'] = 'last'):
-        """
-        Upsert sử dụng native 'ON CONFLICT DO UPDATE' của PostgreSQL.
-        """
         if df.empty: return
-        df = df.copy()
 
         join_keys = [primary_key] if isinstance(primary_key, str) else primary_key
+        if join_keys:
+            join_keys = [k.lower() for k in join_keys]
+            
         if not join_keys:
              logger.warning(f"No keys provided. Switch to APPEND mode.")
-             df.to_sql(target_table, self.engine, if_exists='append', index=False)
+             df.to_sql(target_table, self.engine, schema=self.schema, if_exists='append', index=False)
              return
 
-        # Ép kiểu datetime
-        for col in df.select_dtypes(include=['object', 'str']):
+        for col in df.select_dtypes(include=['object', 'string']):
             if df[col].astype(str).str.match(r'^\d{4}-\d{2}-\d{2}').any():
                 df[col] = pd.to_datetime(df[col], errors='ignore')
 
@@ -234,15 +214,14 @@ class PostgresConnector:
 
         try:
             with self.engine.begin() as conn:
-                # 1. Tạo bảng nếu chưa có
                 inspector = inspect(conn)
-                if not inspector.has_table(target_table):
-                    df.head(0).to_sql(target_table, conn, index=False, dtype=dtype_mapping)
+                
+                if not inspector.has_table(target_table, schema=self.schema):
+                    df.head(0).to_sql(target_table, conn, schema=self.schema, index=False, dtype=dtype_mapping)
                     pk_str = ", ".join([f'"{c}"' for c in join_keys])
-                    conn.execute(text(f'ALTER TABLE "{target_table}" ADD PRIMARY KEY ({pk_str})'))
+                    conn.execute(text(f'ALTER TABLE "{self.schema}"."{target_table}" ADD PRIMARY KEY ({pk_str})'))
                     logger.info(f"Created new table {target_table} with PK {join_keys}")
 
-                # 2. Schema Evolution
                 db_cols = self._get_table_columns(target_table, conn)
                 new_cols = [c for c in df.columns if c.lower() not in [dc.lower() for dc in db_cols]]
                 if new_cols and auto_evolve_schema:
@@ -250,16 +229,20 @@ class PostgresConnector:
                 elif new_cols:
                     df = df.drop(columns=new_cols)
 
-                # 3. Tạo câu lệnh Upsert (Sử dụng SQLAlchemy postgresql.insert)
-                table_cols = df.columns.tolist()
-                chunk_size = 10000 
+                table_cols = [c.lower() for c in df.columns]
+                
+                # SAFE CHUNK SIZE FOR POSTGRESQL (32,767 param limit)
+                # LOWER CHUNK SIZE: 250 ensures we never hit the 32,767 limit even with 130 columns!
+                chunk_size = 250 
+                
                 for i in range(0, len(df), chunk_size):
-                    df_chunk = df.iloc[i : i + chunk_size]
-                    records = df_chunk.to_dict(orient='records')
+                    raw_records = df.iloc[i : i + chunk_size].to_dict(orient='records')
+                    clean_records = self._clean_records(raw_records)
                     
                     metadata_obj = MetaData()
-                    target_table_obj = Table(target_table, metadata_obj, autoload_with=conn)
-                    insert_stmt = insert(target_table_obj).values(records)
+                    target_table_obj = Table(target_table, metadata_obj, schema=self.schema, autoload_with=conn)
+                    
+                    insert_stmt = insert(target_table_obj).values(clean_records)
                     
                     if conflict_strategy == 'skip':
                         upsert_stmt = insert_stmt.on_conflict_do_nothing(index_elements=join_keys)
@@ -269,9 +252,10 @@ class PostgresConnector:
                             for col in table_cols if col not in join_keys
                         }
                         if conflict_strategy == 'sum':
-                            for col in update_dict:
-                                if pd.api.types.is_numeric_dtype(df[col]):
-                                    update_dict[col] = target_table_obj.c[col] + insert_stmt.excluded[col]
+                            for orig_col in df.columns:
+                                lower_col = orig_col.lower()
+                                if lower_col in update_dict and pd.api.types.is_numeric_dtype(df[orig_col]):
+                                    update_dict[lower_col] = target_table_obj.c[lower_col] + insert_stmt.excluded[lower_col]
                                     
                         upsert_stmt = insert_stmt.on_conflict_do_update(
                             index_elements=join_keys,
@@ -281,8 +265,16 @@ class PostgresConnector:
                 logger.success(f"Upserted {len(df)} rows to {target_table} (Strategy: {conflict_strategy})")
 
         except Exception as e:
-            logger.error(f"Upsert failed for {target_table}: {e}")
-            raise e
+            # 1. Truncate the loguru output
+            error_msg = str(e)
+            if len(error_msg) > 800:
+                error_msg = error_msg[:800] + "\n\n... [MASSIVE SQL PARAMETER LOG TRUNCATED] ..."
+            
+            logger.error(f"Upsert failed for {target_table}: {error_msg}")
+            
+            # 2. THE MAGIC FIX: 'from None' destroys the original massive error chain 
+            # so the terminal doesn't spam thousands of lines.
+            raise RuntimeError(f"DB Upsert Failed for {target_table}. See truncated log above.") from None
 
     def dispose(self):
         self.engine.dispose()
