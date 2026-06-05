@@ -53,13 +53,13 @@ This package is published on PyPI. You can easily install it into your project u
 Using Poetry (Recommended):
 
 ```bash
-poetry add PostgreSQLConnector
+poetry add pyposconnector
 ```
 
 Using pip:
 
 ```bash
-pip install PostgreSQLConnector
+pip install pyposconnector
 ```
 
 ## 🛠️ Dependencies
