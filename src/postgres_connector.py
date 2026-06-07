@@ -1,6 +1,7 @@
 import io
 import pandas as pd
-from typing import List, Optional, Dict, Union, Literal
+from contextlib import nullcontext
+from typing import Iterator, List, Optional, Dict, Union, Literal
 from loguru import logger
 from sqlalchemy import create_engine, text, URL, inspect, MetaData, Table
 from sqlalchemy.types import BIGINT
@@ -16,14 +17,18 @@ except ImportError:
 
 class PostgresConnector:
     """
-    Trình kết nối PostgreSQL chuẩn hóa.
+    PostgreSQL connector built on psycopg 3 + SQLAlchemy 2.
 
-    Quy tắc cột:
-      - Mọi tên cột đều được lowercase trước khi đẩy vào DB.
-      - Không dùng double-quote bao quanh tên cột trong DDL/DML
-        (PostgreSQL tự fold về lowercase khi không có quote).
-      - Chỉ double-quote tên SCHEMA và tên TABLE (để tránh conflict
-        với reserved words).
+    Column conventions:
+      - All column names are lowercased before writing to the DB.
+      - Table and schema names are double-quoted in DDL/DML.
+      - Column names are never double-quoted (PostgreSQL folds unquoted to lowercase).
+
+    psycopg 3 optimizations applied:
+      - Native COPY FROM STDIN API (replaces psycopg2's copy_expert).
+      - Auto-prepared statements via prepare_threshold.
+      - Pipeline mode for multi-chunk upsert/insert loops.
+      - Server-side cursors for streaming large result sets.
     """
 
     def __init__(
@@ -34,6 +39,10 @@ class PostgresConnector:
         password: str,
         port: int = 5432,
         schema: str = "public",
+        pool_size: int = 5,
+        max_overflow: int = 10,
+        pool_timeout: float = 30.0,
+        prepare_threshold: int = 5,
         **kwargs,
     ):
         self.host = host
@@ -44,7 +53,7 @@ class PostgresConnector:
         self.schema = schema
 
         self.connection_url = URL.create(
-            "postgresql+psycopg2",
+            "postgresql+psycopg",          # psycopg 3 driver
             username=self.username,
             password=self.password,
             host=self.host,
@@ -55,8 +64,16 @@ class PostgresConnector:
         self.engine = create_engine(
             self.connection_url,
             pool_pre_ping=True,
-            insertmanyvalues_page_size=10000,
-            connect_args={"options": f"-csearch_path={self.schema}"},
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
+            insertmanyvalues_page_size=10_000,
+            connect_args={
+                "options": f"-csearch_path={self.schema}",
+                # Auto-prepare a statement after this many executions per connection.
+                # Reduces parse/plan overhead for repeated queries (e.g. chunk loops).
+                "prepare_threshold": prepare_threshold,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -71,12 +88,57 @@ class PostgresConnector:
             logger.error(f"execute_query error: {e}")
             raise
 
-    def get_data(self, query: str, params: Optional[Dict] = None) -> pd.DataFrame:
+    def get_data(
+        self,
+        query: str,
+        params: Optional[Dict] = None,
+        stream: bool = False,
+        stream_buffer: int = 2_000,
+    ) -> pd.DataFrame:
+        """
+        Fetch query results as a DataFrame.
+
+        Args:
+            stream: Use a server-side cursor so rows are fetched in batches rather
+                    than loading the entire result set into memory at once.
+                    Ideal for queries that return very large result sets.
+            stream_buffer: Row buffer size when stream=True (default 2 000).
+        """
         try:
             with self.engine.connect() as conn:
+                if stream:
+                    conn = conn.execution_options(
+                        stream_results=True,
+                        max_row_buffer=stream_buffer,
+                    )
                 return pd.read_sql(text(query), conn, params=params)
         except Exception as e:
             logger.error(f"get_data error: {e}")
+            raise
+
+    def get_data_chunks(
+        self,
+        query: str,
+        params: Optional[Dict] = None,
+        chunksize: int = 10_000,
+    ) -> Iterator[pd.DataFrame]:
+        """
+        Stream query results as an iterator of DataFrames (each ~`chunksize` rows).
+        Memory-efficient alternative to get_data for very large result sets.
+
+        Example::
+
+            for chunk in pg.get_data_chunks("SELECT * FROM big_table"):
+                process(chunk)
+        """
+        try:
+            with self.engine.connect() as conn:
+                conn = conn.execution_options(stream_results=True)
+                yield from pd.read_sql(
+                    text(query), conn, params=params, chunksize=chunksize
+                )
+        except Exception as e:
+            logger.error(f"get_data_chunks error: {e}")
             raise
 
     def check_table_exists(self, table_name: str) -> bool:
@@ -95,7 +157,7 @@ class PostgresConnector:
     # ------------------------------------------------------------------
 
     def _lower_df_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Return df with all column names lowercased (in-place rename)."""
+        """Return df with all column names lowercased."""
         df.columns = [c.lower() for c in df.columns]
         return df
 
@@ -137,7 +199,7 @@ class PostgresConnector:
         self, table_name: str, missing_cols: List[str], dtype_map: Dict, conn
     ) -> None:
         """
-        ALTER TABLE to add columns that exist in the DataFrame but not in DB.
+        ALTER TABLE to add columns that exist in the DataFrame but not in the DB.
         Columns are always added as lowercase, unquoted names.
         """
         type_map = {
@@ -157,14 +219,16 @@ class PostgresConnector:
             if _PGVECTOR_AVAILABLE and isinstance(col_type, Vector):
                 type_str = f"VECTOR({col_type.dim})"
 
-            # Use unquoted column name → Postgres stores it lowercase
             conn.execute(
                 text(
                     f'ALTER TABLE "{self.schema}"."{table_name}" '
                     f"ADD COLUMN IF NOT EXISTS {col_lower} {type_str}"
                 )
             )
-            logger.info(f"Auto-evolve: added '{col_lower}' ({type_str}) to '{self.schema}.{table_name}'")
+            logger.info(
+                f"Auto-evolve: added '{col_lower}' ({type_str}) to "
+                f"'{self.schema}.{table_name}'"
+            )
 
     def _clean_records(self, records: List[Dict]) -> List[Dict]:
         """
@@ -186,7 +250,7 @@ class PostgresConnector:
                     row[key] = None
                 elif isinstance(v, pd.Timestamp):
                     row[key] = v.to_pydatetime()
-                elif hasattr(v, "item"):          # numpy scalar → Python scalar
+                elif hasattr(v, "item"):      # numpy scalar → Python scalar
                     row[key] = v.item()
                 else:
                     row[key] = v
@@ -205,17 +269,17 @@ class PostgresConnector:
         Runs DDL on the provided open connection (caller manages transaction).
         """
         dtype_mapping = self._generate_dtype_mapping(df)
-        # to_sql for DDL only (0 rows) — safe inside a transaction for CREATE
+        # to_sql for DDL only (0 rows)
         df.head(0).to_sql(
             table_name,
             conn,
             schema=self.schema,
-            if_exists="fail",       # never DROP inside an open tx
+            if_exists="fail",
             index=False,
             dtype=dtype_mapping,
         )
         if primary_keys:
-            pk_str = ", ".join(primary_keys)  # unquoted → lowercase
+            pk_str = ", ".join(primary_keys)
             conn.execute(
                 text(
                     f'ALTER TABLE "{self.schema}"."{table_name}" '
@@ -229,6 +293,17 @@ class PostgresConnector:
         meta = MetaData()
         return Table(table_name, meta, schema=self.schema, autoload_with=conn)
 
+    @staticmethod
+    def _get_psycopg_conn(sqlalchemy_conn):
+        """
+        Extract the underlying psycopg 3 Connection from a SQLAlchemy Connection.
+        Returns None if the driver connection does not expose pipeline().
+        """
+        try:
+            return sqlalchemy_conn.connection.driver_connection
+        except AttributeError:
+            return None
+
     # ------------------------------------------------------------------
     # CORE OPERATIONS
     # ------------------------------------------------------------------
@@ -240,8 +315,8 @@ class PostgresConnector:
         primary_key: Union[str, List[str], None] = None,
     ) -> None:
         """
-        DROP + CREATE + bulk INSERT.
-        DDL is run *before* opening the data transaction to avoid lock issues.
+        DROP + CREATE + bulk-COPY INSERT.
+        DDL runs in its own short transaction; data load uses COPY FROM STDIN.
         """
         if df.empty:
             return
@@ -253,14 +328,14 @@ class PostgresConnector:
         )
 
         try:
-            # Step 1: DDL in its own short transaction
+            # Step 1: DDL in its own transaction
             with self.engine.begin() as conn:
                 conn.execute(
                     text(f'DROP TABLE IF EXISTS "{self.schema}"."{target_table}"')
                 )
                 self._create_table_from_df(df, target_table, conn, pk_cols)
 
-            # Step 2: Bulk INSERT via COPY (fastest, no lock risk)
+            # Step 2: Bulk load via psycopg 3 COPY (fastest path)
             self._copy_insert(df, target_table)
 
             logger.success(f"replace_table '{target_table}': {len(df)} rows.")
@@ -276,7 +351,8 @@ class PostgresConnector:
         delete_keys: Union[str, List[str]],
     ) -> None:
         """
-        DELETE matching rows then INSERT. Fully parameterized — no SQL injection.
+        DELETE matching rows then INSERT new ones.
+        Chunk loop runs inside a psycopg 3 pipeline for reduced round-trips.
         """
         if df.empty:
             return
@@ -294,7 +370,6 @@ class PostgresConnector:
                     for key in keys:
                         unique_vals = df[key].dropna().unique().tolist()
                         if unique_vals:
-                            # Parameterized DELETE — safe for any value type
                             conn.execute(
                                 text(
                                     f'DELETE FROM "{self.schema}"."{target_table}" '
@@ -305,11 +380,21 @@ class PostgresConnector:
 
                 table_obj = self._load_table_object(target_table, conn)
                 chunk_size = self._safe_chunk_size(len(df.columns))
-                for i in range(0, len(df), chunk_size):
-                    records = self._clean_records(
-                        df.iloc[i: i + chunk_size].to_dict(orient="records")
-                    )
-                    conn.execute(insert(table_obj).values(records))
+
+                # Use psycopg 3 pipeline: batch all INSERT statements without
+                # waiting for per-statement ACKs. Falls back silently if
+                # driver_connection is unavailable.
+                psycopg_conn = self._get_psycopg_conn(conn)
+                pipeline_ctx = (
+                    psycopg_conn.pipeline() if psycopg_conn is not None
+                    else nullcontext()
+                )
+                with pipeline_ctx:
+                    for i in range(0, len(df), chunk_size):
+                        records = self._clean_records(
+                            df.iloc[i: i + chunk_size].to_dict(orient="records")
+                        )
+                        conn.execute(insert(table_obj).values(records))
 
             logger.success(f"delete_and_insert '{target_table}': {len(df)} rows.")
 
@@ -326,13 +411,13 @@ class PostgresConnector:
         conflict_strategy: Literal["sum", "last", "skip"] = "last",
     ) -> None:
         """
-        INSERT … ON CONFLICT DO UPDATE/NOTHING.
+        INSERT … ON CONFLICT DO UPDATE / NOTHING.
 
-        Key fixes vs previous version:
-          - MetaData/Table reflected ONCE outside the chunk loop (not per-chunk).
+        Improvements over the psycopg2 version:
+          - MetaData/Table reflected ONCE outside the chunk loop.
+          - Chunk loop runs in psycopg 3 pipeline mode (fewer round-trips).
           - All column names lowercased before any DB interaction.
-          - No auto-date coercion on object columns (was causing false positives).
-          - Parameterized; no raw f-string SQL injection risk.
+          - Auto-prepare threshold speeds up repeated chunk statements.
         """
         if df.empty:
             return
@@ -350,7 +435,7 @@ class PostgresConnector:
             df.to_sql(
                 target_table, self.engine, schema=self.schema,
                 if_exists="append", index=False,
-                method="multi", chunksize=2000,
+                method="multi", chunksize=2_000,
             )
             return
 
@@ -360,11 +445,11 @@ class PostgresConnector:
             with self.engine.begin() as conn:
                 inspector = inspect(conn)
 
-                # --- Create table if missing ---
+                # Create table if missing
                 if not inspector.has_table(target_table, schema=self.schema):
                     self._create_table_from_df(df, target_table, conn, join_keys)
 
-                # --- Auto-evolve: add new columns ---
+                # Auto-evolve: add new columns
                 db_cols = self._get_table_columns(target_table, conn)
                 new_cols = [c for c in df.columns if c not in db_cols]
                 if new_cols:
@@ -373,38 +458,45 @@ class PostgresConnector:
                     else:
                         df = df.drop(columns=new_cols)
 
-                # --- Reflect Table ONCE (not per chunk) ---
+                # Reflect Table ONCE (not per chunk)
                 table_obj = self._load_table_object(target_table, conn)
                 table_cols = [c.lower() for c in df.columns]
                 chunk_size = self._safe_chunk_size(len(df.columns))
 
-                for i in range(0, len(df), chunk_size):
-                    records = self._clean_records(
-                        df.iloc[i: i + chunk_size].to_dict(orient="records")
-                    )
-                    insert_stmt = insert(table_obj).values(records)
+                # psycopg 3 pipeline: all chunk upserts sent without per-chunk RTT
+                psycopg_conn = self._get_psycopg_conn(conn)
+                pipeline_ctx = (
+                    psycopg_conn.pipeline() if psycopg_conn is not None
+                    else nullcontext()
+                )
+                with pipeline_ctx:
+                    for i in range(0, len(df), chunk_size):
+                        records = self._clean_records(
+                            df.iloc[i: i + chunk_size].to_dict(orient="records")
+                        )
+                        insert_stmt = insert(table_obj).values(records)
 
-                    if conflict_strategy == "skip":
-                        upsert_stmt = insert_stmt.on_conflict_do_nothing(
-                            index_elements=join_keys
-                        )
-                    else:
-                        update_dict = {
-                            col: insert_stmt.excluded[col]
-                            for col in table_cols
-                            if col not in join_keys
-                        }
-                        if conflict_strategy == "sum":
-                            for col in table_cols:
-                                if col in update_dict and pd.api.types.is_numeric_dtype(df[col]):
-                                    update_dict[col] = (
-                                        table_obj.c[col] + insert_stmt.excluded[col]
-                                    )
-                        upsert_stmt = insert_stmt.on_conflict_do_update(
-                            index_elements=join_keys,
-                            set_=update_dict,
-                        )
-                    conn.execute(upsert_stmt)
+                        if conflict_strategy == "skip":
+                            upsert_stmt = insert_stmt.on_conflict_do_nothing(
+                                index_elements=join_keys
+                            )
+                        else:
+                            update_dict = {
+                                col: insert_stmt.excluded[col]
+                                for col in table_cols
+                                if col not in join_keys
+                            }
+                            if conflict_strategy == "sum":
+                                for col in table_cols:
+                                    if col in update_dict and pd.api.types.is_numeric_dtype(df[col]):
+                                        update_dict[col] = (
+                                            table_obj.c[col] + insert_stmt.excluded[col]
+                                        )
+                            upsert_stmt = insert_stmt.on_conflict_do_update(
+                                index_elements=join_keys,
+                                set_=update_dict,
+                            )
+                        conn.execute(upsert_stmt)
 
             logger.success(
                 f"upsert_data '{target_table}': {len(df)} rows "
@@ -418,33 +510,40 @@ class PostgresConnector:
             ) from None
 
     # ------------------------------------------------------------------
-    # BULK COPY (fastest path for large loads)
+    # BULK COPY — psycopg 3 native COPY API (fastest ingestion path)
     # ------------------------------------------------------------------
 
     def _copy_insert(self, df: pd.DataFrame, target_table: str) -> None:
         """
-        Bulk-load df into an existing table via COPY FROM STDIN.
-        df must already have lowercase columns.
-        Fastest method: streams CSV directly to Postgres, no row-by-row params.
+        Bulk-load df into an existing table via psycopg 3's COPY FROM STDIN.
+
+        psycopg 3 replaces psycopg2's ``copy_expert`` with a context-manager
+        ``cursor.copy()`` that streams data without per-row parameter binding.
+        This is the fastest ingestion path for large DataFrames.
+
+        df must already have lowercase column names.
         """
-        cols = ", ".join(df.columns.tolist())
+        cols = list(df.columns)
         qualified = f'"{self.schema}"."{target_table}"'
+        col_list = ", ".join(cols)
 
         buf = io.StringIO()
         df.to_csv(buf, index=False, header=False, na_rep="\\N")
         buf.seek(0)
+        csv_data = buf.getvalue()
 
+        # raw_connection() returns a psycopg 3 DBAPI Connection from the pool.
         raw_conn = self.engine.raw_connection()
         try:
             with raw_conn.cursor() as cur:
-                cur.copy_expert(
-                    f"COPY {qualified} ({cols}) FROM STDIN "
-                    f"WITH (FORMAT csv, NULL '\\N')",
-                    buf,
-                )
+                with cur.copy(
+                    f"COPY {qualified} ({col_list}) FROM STDIN "
+                    f"WITH (FORMAT csv, NULL '\\N')"
+                ) as copy:
+                    copy.write(csv_data)
             raw_conn.commit()
         finally:
-            raw_conn.close()
+            raw_conn.close()  # returns the connection to the pool
 
     # ------------------------------------------------------------------
     # UTILITY
@@ -453,12 +552,12 @@ class PostgresConnector:
     @staticmethod
     def _safe_chunk_size(n_cols: int) -> int:
         """
-        PostgreSQL hard limit: 32,767 bind parameters per statement.
-        Leave a small buffer.
+        PostgreSQL hard limit: 32 767 bind parameters per statement.
+        Stay well under that limit regardless of column count.
         """
         if n_cols == 0:
             return 500
-        return max(1, min(500, 32000 // n_cols))
+        return max(1, min(500, 32_000 // n_cols))
 
     @staticmethod
     def _log_error(prefix: str, exc: Exception) -> None:
